@@ -1,0 +1,107 @@
+import torch
+import torch.nn as nn
+
+# =========================================================
+# Positional Encoding
+# =========================================================
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2) * (-torch.log(torch.tensor(10000.0)) / d_model)
+        )
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe.unsqueeze(0))
+
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1)]
+
+
+# =========================================================
+# ECM (Early Context Module)
+# =========================================================
+class ECM(nn.Module):
+    def __init__(self, channels, hidden=16):
+        super().__init__()
+
+        self.temporal = nn.ModuleList([
+            nn.Conv1d(channels, channels, 3, padding=1, groups=channels),
+            nn.Conv1d(channels, channels, 7, padding=3, groups=channels),
+        ])
+
+        self.fc = nn.Sequential(
+            nn.Linear(channels * 2, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, channels),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        # x: (B, T, C)
+        xt = x.transpose(1, 2)
+        local = sum(conv(xt) for conv in self.temporal).transpose(1, 2)
+
+        local_ctx = local.mean(dim=1)
+        global_ctx = x.mean(dim=1)
+
+        gate = self.fc(torch.cat([local_ctx, global_ctx], dim=-1))
+        return x + x * gate.unsqueeze(1)
+
+
+# =========================================================
+# Transformer Agitation Model + ECM
+# =========================================================
+class TransformerAgitation(nn.Module):
+    def __init__(self, input_dim=6, embed_dim=32, num_heads=4, num_layers=2):
+        super().__init__()
+
+        # ✅ ECM added
+        self.ecm = ECM(input_dim)
+        self.ecm_norm = nn.LayerNorm(input_dim)
+
+        self.embedding = nn.Linear(input_dim, embed_dim)
+        self.pos_encoding = PositionalEncoding(embed_dim)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers=num_layers
+        )
+
+        self.fc = nn.Linear(embed_dim, 1)
+
+    def forward(self, x):
+        # x: (B, T, C)
+
+        # 1) ECM
+        x = self.ecm(x)
+        x = self.ecm_norm(x)
+
+        # 2) Embedding + Positional Encoding
+        x = self.embedding(x)
+        x = self.pos_encoding(x)
+
+        # 3) Transformer
+        x = self.transformer(x)
+
+        # 4) Temporal pooling
+        x = x.mean(dim=1)
+
+        # 5) Output
+        return torch.sigmoid(self.fc(x)).squeeze(-1)
+
+
+# =========================================================
+# Quick sanity test
+# =========================================================
+if __name__ == "__main__":
+    model = TransformerAgitation()
+    x = torch.randn(8, 120, 6)
+    y = model(x)
+    print("Output shape:", y.shape)
