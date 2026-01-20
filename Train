@@ -1,0 +1,248 @@
+# train.py  -- Agitation Transformer with gradient accumulation
+
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from sklearn.metrics import roc_auc_score, average_precision_score
+from sklearn.model_selection import KFold
+from tqdm import tqdm
+
+from dataset import AgitationDataset
+#from model_2 import AgitationTransformerPro  # improved model
+from model_2 import AgitationHybridPro  # Updated name
+
+
+# ------------------- Utils -------------------
+
+def seed_everything(seed: int = 42):
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def get_lr(optimizer):
+    for pg in optimizer.param_groups:
+        return pg["lr"]
+
+
+def maybe_log_lr_change(prev_lr, optimizer):
+    curr_lr = get_lr(optimizer)
+    if curr_lr < prev_lr:
+        print(f"[Scheduler] Learning rate reduced: {prev_lr:.6f} -> {curr_lr:.6f}")
+    return curr_lr
+
+
+# --------------- Train/Eval for one fold ---------------
+
+def train_and_evaluate_fold(
+    fold_id: int,
+    train_indices,
+    test_indices,
+    full_data,
+    full_labels,
+    downsample: int,
+    epochs: int,
+    batch_size: int,
+    num_workers: int = 4,
+    lr: float = 1e-3,
+    weight_decay: float = 1e-4,
+    grad_clip: float = 1.0,
+    early_patience: int = 4,
+    accum_steps: int = 1,   # <<< gradient accumulation steps
+):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Split arrays
+    train_data = full_data[train_indices]
+    train_labels = full_labels[train_indices]
+    test_data  = full_data[test_indices]
+    test_labels = full_labels[test_indices]
+
+    # Datasets (fit scaler on train, reuse on test)
+    train_ds = AgitationDataset(train_data, train_labels, downsample, fit_scaler=True)
+    test_ds  = AgitationDataset(test_data,  test_labels,  downsample, scaler=train_ds.scaler)
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+    test_loader  = DataLoader(
+        test_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+
+    # Class imbalance handling
+    num_pos = int((train_labels == 1).sum())
+    num_neg = int((train_labels == 0).sum())
+    pos_weight_val = num_neg / max(1, num_pos)
+    pos_weight = torch.tensor([pos_weight_val], device=device, dtype=torch.float32)
+
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+    # Model (improved)
+    model = AgitationHybridPro(
+        input_dim=6,
+        embed_dim=64,
+        num_heads=8,
+        num_layers=4,
+        conv_stride=2,              # learnable temporal downsample
+        max_len=1024,
+        transformer_dropout=0.1,
+        head_dropout=0.3,
+        multisample_dropout=4,
+    ).to(device)
+
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=0.5, patience=2
+    )
+
+    best_auc = 0.0
+    best_path = f"best_pro_fold{fold_id}.pt"
+    no_improve = 0
+    prev_lr = get_lr(optimizer)
+
+    # Safety: at least 1
+    accum_steps = max(1, accum_steps)
+
+    for epoch in range(1, epochs + 1):
+        # --------- Train ---------
+        model.train()
+        running_loss = 0.0
+
+        optimizer.zero_grad(set_to_none=True)
+
+        for step, (x, y) in enumerate(
+            tqdm(train_loader, desc=f"[Fold {fold_id}] Train E{epoch}/{epochs}")
+        ):
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, dtype=torch.float32, non_blocking=True)
+
+            logits = model(x)                 # (B,) logits
+            loss = criterion(logits, y)
+
+            # for logging: the *true* batch loss (before scaling)
+            running_loss += loss.item()
+
+            # Scale loss for gradient accumulation
+            loss = loss / accum_steps
+            loss.backward()
+
+            # Do optimizer step every accum_steps mini-batches
+            if (step + 1) % accum_steps == 0 or (step + 1) == len(train_loader):
+                if grad_clip is not None:
+                    nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+        train_loss = running_loss / max(1, len(train_loader))
+
+        # --------- Eval ---------
+        model.eval()
+        all_probs, all_labels = [], []
+        with torch.no_grad():
+            for x, y in tqdm(test_loader, desc=f"[Fold {fold_id}] Eval  E{epoch}/{epochs}"):
+                x = x.to(device, non_blocking=True)
+                logits = model(x)
+                probs = torch.sigmoid(logits).detach().cpu().numpy()
+                all_probs.extend(probs)
+                all_labels.extend(y.numpy())
+
+        auc = roc_auc_score(all_labels, all_probs)
+        auprc = average_precision_score(all_labels, all_probs)
+
+        print(f"\n[Fold {fold_id}] Epoch {epoch}: "
+              f"train_loss={train_loss:.4f} AUC={auc:.4f} AUPRC={auprc:.4f}")
+
+        # LR schedule on AUC
+        scheduler.step(auc)
+        prev_lr = maybe_log_lr_change(prev_lr, optimizer)
+
+        # Early stopping on AUC
+        if auc > best_auc:
+            best_auc = auc
+            torch.save(model.state_dict(), best_path)
+            no_improve = 0
+            print(f"[Fold {fold_id}] ✅ New best AUC {best_auc:.4f} — saved to {best_path}")
+        else:
+            no_improve += 1
+            if no_improve >= early_patience:
+                print(f"[Fold {fold_id}] Early stopping (no improvement for {early_patience} epochs).")
+                break
+
+    print(f"[Fold {fold_id}] Finished. Best Test AUC: {best_auc:.4f}")
+    return best_auc
+
+
+# ------------------- Main -------------------
+
+if __name__ == "__main__":
+    seed_everything(42)
+
+    # Load preprocessed arrays (windows already segmented; shape ~ (N, T, 6))
+    # For 4 participants:
+    X = np.load("processed_4p/X_train.npy", mmap_mode='r')
+    y = np.load("processed_4p/y_train.npy", mmap_mode='r')
+
+    # For all 17 participants later, just change paths to processed_17p/...
+
+    print(f"Loaded: X={X.shape}  y={y.shape}  positives={(y==1).sum()}  negatives={(y==0).sum()}")
+
+    # Hyperparameters
+    DOWNSAMPLE_FACTOR = 16      # stride-based in AgitationDataset (e.g., 3840 -> 240 if 16x)
+    MAX_EPOCHS = 50
+
+    # Micro-batch that fits in memory
+    BATCH_SIZE = 32             # physical batch size in DataLoader
+
+    # Target "virtual" batch size (what you liked before)
+    TARGET_BATCH = 512          # effective batch  wanted 
+    ACCUM_STEPS = max(1, TARGET_BATCH // BATCH_SIZE)   # 512 // 32 = 16
+
+    print(f"\nUsing micro-batch {BATCH_SIZE} with gradient accumulation {ACCUM_STEPS} "
+          f"-> effective batch size ≈ {BATCH_SIZE * ACCUM_STEPS}")
+
+    N_FOLDS = 2
+    NUM_WORKERS = 0
+
+    # 2-fold CV (paper-style 50/50)
+    kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=42)
+
+    all_test_aucs = []
+    for fold_id, (train_index, test_index) in enumerate(kf.split(X, y), start=1):
+        print(f"\n================== Starting Fold {fold_id}/{N_FOLDS} ==================")
+        fold_auc = train_and_evaluate_fold(
+            fold_id=fold_id,
+            train_indices=train_index,
+            test_indices=test_index,
+            full_data=X,
+            full_labels=y,
+            downsample=DOWNSAMPLE_FACTOR,
+            epochs=MAX_EPOCHS,
+            batch_size=BATCH_SIZE,
+            num_workers=NUM_WORKERS,
+            lr=1e-3,
+            weight_decay=1e-4,
+            grad_clip=1.0,
+            early_patience=4,
+            accum_steps=ACCUM_STEPS,    # <<< key line
+        )
+        all_test_aucs.append(fold_auc)
+
+    avg_auc = float(np.mean(all_test_aucs))
+    std_auc = float(np.std(all_test_aucs))
+    print("\n========================= Training Complete =========================")
+    print(f"Final Report (AUC ROC) — Avg ± Std: {avg_auc:.3f} ± {std_auc:.3f}")
