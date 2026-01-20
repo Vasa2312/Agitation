@@ -1,0 +1,181 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import OneCycleLR
+from torch.utils.data import TensorDataset, DataLoader, WeightedRandomSampler # <--- Added Imports
+import random
+
+# =========================================================
+# --------- DATA AUGMENTATION
+# =========================================================
+def augment_timeseries(x, noise_std=0.02, time_mask_ratio=0.1, channel_drop_prob=0.1):
+    B, T, C = x.shape
+    if noise_std > 0:
+        x = x + noise_std * torch.randn_like(x)
+    
+    mask_len = int(T * time_mask_ratio)
+    if mask_len > 0:
+        for b in range(B):
+            start = random.randint(0, T - mask_len)
+            x[b, start:start + mask_len] = 0
+
+    for c in range(C):
+        if random.random() < channel_drop_prob:
+            x[:, :, c] = 0
+    return x
+
+
+# =========================================================
+# --------- FOCAL LOSS
+# =========================================================
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2.0, pos_weight=None):
+        super().__init__()
+        self.gamma = gamma
+        self.register_buffer("pos_weight", pos_weight)
+
+    def forward(self, logits, targets):
+        bce = F.binary_cross_entropy_with_logits(
+            logits, targets.float(), pos_weight=self.pos_weight, reduction="none"
+        )
+        pt = torch.exp(-bce)
+        return ((1 - pt) ** self.gamma * bce).mean()
+
+
+# =========================================================
+# --------- MODEL COMPONENTS
+# =========================================================
+class TemporalPatchEmbed(nn.Module):
+    def __init__(self, in_ch=6, embed_dim=64, kernel_size=5, stride=2, padding=2):
+        super().__init__()
+        self.proj = nn.Conv1d(in_ch, embed_dim, kernel_size, stride, padding)
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x):
+        x = self.proj(x.transpose(1, 2)).transpose(1, 2)
+        return self.norm(x)
+
+
+class LearnablePositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=1024):
+        super().__init__()
+        self.pe = nn.Parameter(torch.zeros(1, max_len, d_model))
+        self.cls = nn.Parameter(torch.zeros(1, 1, d_model))
+        nn.init.trunc_normal_(self.pe, std=0.02)
+        nn.init.trunc_normal_(self.cls, std=0.02)
+
+    def forward(self, x):
+        B, T, _ = x.shape
+        x = x + self.pe[:, :T]
+        cls = self.cls.expand(B, -1, -1)
+        return torch.cat([cls, x], dim=1)
+
+
+class AgitationHybridPro(nn.Module):
+    def __init__(self, input_dim=6, embed_dim=64, lstm_hidden=32, num_heads=8, num_layers=4, conv_stride=2, max_len=1024, transformer_dropout=0.1, head_dropout=0.3, multisample_dropout=4):
+        super().__init__()
+        self.patch = TemporalPatchEmbed(input_dim, embed_dim, stride=conv_stride)
+        self.pos = LearnablePositionalEncoding(embed_dim, max_len)
+        enc_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads, dim_feedforward=embed_dim * 4, dropout=transformer_dropout, activation="gelu", batch_first=True)
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers)
+        self.trans_norm = nn.LayerNorm(embed_dim)
+        self.lstm = nn.LSTM(input_size=input_dim, hidden_size=lstm_hidden, num_layers=2, batch_first=True, bidirectional=True, dropout=transformer_dropout)
+        fusion_dim = embed_dim + (lstm_hidden * 2)
+        self.head = nn.Sequential(nn.Linear(fusion_dim, 128), nn.GELU(), nn.Dropout(head_dropout), nn.Linear(128, 1))
+        self.ms_drop = max(1, multisample_dropout)
+
+    def forward(self, x):
+        x_trans = self.patch(x)
+        x_trans = self.pos(x_trans)
+        x_trans = self.encoder(x_trans)
+        feat_trans = x_trans[:, 0]
+        self.lstm.flatten_parameters()
+        _, (h_n, _) = self.lstm(x)
+        feat_lstm = torch.cat([h_n[-2], h_n[-1]], dim=1)
+        combined_feat = torch.cat([feat_trans, feat_lstm], dim=1)
+        if self.training and self.ms_drop > 1:
+            logits = sum(self.head(combined_feat) for _ in range(self.ms_drop)) / self.ms_drop
+        else:
+            logits = self.head(combined_feat)
+        return logits.squeeze(-1)
+
+
+# =========================================================
+# --------- MAIN EXECUTION
+# =========================================================
+if __name__ == "__main__":
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Running on: {device}")
+
+    # 1. SETUP DUMMY DATA (IMBALANCED)
+    # -----------------------------------------------------
+    N_SAMPLES = 1000
+    # 900 "Normal" (Class 0), 100 "Agitation" (Class 1) -> 90:10 Imbalance
+    x_data = torch.randn(N_SAMPLES, 120, 6) 
+    y_data = torch.cat([torch.zeros(900), torch.ones(100)]).long()
+    
+    # Shuffle initially so they aren't ordered 000...111...
+    idx = torch.randperm(N_SAMPLES)
+    x_data = x_data[idx]
+    y_data = y_data[idx]
+
+    # 2. IMPLEMENT WEIGHTED RANDOM SAMPLER
+    # -----------------------------------------------------
+    # Calculate count of each class
+    class_counts = [900, 100] # Class 0, Class 1
+    
+    # Calculate weight per class (Inverse frequency)
+    # Weight for 0 = 1/900 (Small), Weight for 1 = 1/100 (Large)
+    class_weights = 1.0 / torch.tensor(class_counts, dtype=torch.float)
+    
+    # Assign a weight to EVERY sample in the dataset based on its label
+    sample_weights = [class_weights[t] for t in y_data]
+    sample_weights = torch.tensor(sample_weights, dtype=torch.double)
+    
+    # Create the Sampler
+    # replacement=True allows the sampler to pick the same "Agitation" sample multiple times in one epoch
+    sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
+
+    # Create DataLoader
+    dataset = TensorDataset(x_data, y_data)
+    train_loader = DataLoader(dataset, batch_size=32, sampler=sampler)
+    
+    print("DataLoader created with WeightedRandomSampler.")
+
+    # 3. SETUP MODEL & TRAINING
+    # -----------------------------------------------------
+    model = AgitationHybridPro(lstm_hidden=32).to(device)
+    EPOCHS = 5
+    LR = 3e-4
+    
+    optimizer = AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
+    scheduler = OneCycleLR(optimizer, max_lr=LR, total_steps=EPOCHS * len(train_loader), pct_start=0.1)
+
+    # Note: With WeightedSampler, batches are balanced (50/50), so pos_weight in loss can be 1.0
+    criterion = FocalLoss(gamma=2.5, pos_weight=torch.tensor([1.0], device=device))
+
+    # 4. TRAINING LOOP
+    # -----------------------------------------------------
+    for epoch in range(EPOCHS):
+        model.train()
+        total_loss = 0
+        
+        # Loop over the DataLoader (Batch by Batch)
+        for i, (x_batch, y_batch) in enumerate(train_loader):
+            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
+
+            # Apply Augmentation
+            x_aug = augment_timeseries(x_batch)
+
+            optimizer.zero_grad()
+            logits = model(x_aug)
+            loss = criterion(logits, y_batch)
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+            
+            total_loss += loss.item()
+
+        avg_loss = total_loss / len(train_loader)
+        print(f"Epoch {epoch+1}/{EPOCHS} | Avg Loss: {avg_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.6f}")
