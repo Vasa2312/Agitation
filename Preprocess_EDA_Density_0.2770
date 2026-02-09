@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+import os
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from scipy.signal import butter, lfilter, find_peaks
+
+# ===================== CONFIG =====================
+FS = 64
+WIN_SIZE = 3840
+CUTOFF_FREQ = 5.0
+ORDER = 4
+
+DATASET_ROOT = Path("/home/srik/Desktop/Seenivasa/Datasets_and_scripts")
+
+# =================================================
+
+
+# ================= FILTERING =====================
+def butter_lowpass(cutoff, fs, order=5):
+    nyq = 0.5 * fs
+    normal_cutoff = cutoff / nyq
+    b, a = butter(order, normal_cutoff, btype="low", analog=False)
+    return b, a
+
+
+def filter_signal(data, cutoff=CUTOFF_FREQ, fs=FS, order=ORDER):
+    b, a = butter_lowpass(cutoff, fs, order=order)
+    return lfilter(b, a, data, axis=0)
+
+
+# ================= EDA SPIKE DENSITY =================
+def compute_eda_spike_density(eda_signal, fs=FS, window_sec=60):
+
+    smooth_win = int(0.5 * fs)
+    eda_smooth = np.convolve(
+        eda_signal,
+        np.ones(smooth_win) / smooth_win,
+        mode="same"
+    )
+
+    baseline = np.mean(eda_smooth)
+    threshold = baseline + 2 * np.std(eda_smooth)
+
+    peaks, _ = find_peaks(
+        eda_smooth,
+        height=threshold,
+        distance=int(0.5 * fs)
+    )
+
+    density = np.zeros(len(eda_signal))
+    window_samples = window_sec * fs
+
+    for i in range(len(eda_signal)):
+        start = max(0, i - window_samples)
+        density[i] = np.sum(
+            (peaks >= start) & (peaks <= i)
+        )
+
+    return density
+
+
+# ================= LOADING + SEGMENTATION =================
+def load_and_segment(csv_path):
+
+    df = pd.read_csv(csv_path)
+
+    required_cols = ["eda", "accx", "accy", "accz", "bvp", "temp", "label"]
+    for c in required_cols:
+        if c not in df.columns:
+            raise ValueError(f"Missing column: {c}")
+
+    acc_mag = np.sqrt(df['accx']**2 + df['accy']**2 + df['accz']**2)
+    df['enmo'] = np.maximum(acc_mag - 1.0, 0)
+    df['jerk'] = np.diff(acc_mag, prepend=acc_mag[0])
+
+    # Filter signals
+    filtered = df[["eda", "enmo", "bvp", "temp"]].apply(
+        filter_signal, axis=0
+    )
+
+    # Compute spike density
+    eda_density = compute_eda_spike_density(
+        filtered["eda"].values,
+        fs=FS
+    )
+
+    # Combine signals
+    signals = np.column_stack([
+        filtered.values,
+        eda_density
+    ])
+
+    labels = df["label"].values
+
+    num_samples = len(df)
+    num_windows = num_samples // WIN_SIZE
+
+    X, y = [], []
+
+    for w in range(num_windows):
+        start = w * WIN_SIZE
+        end = start + WIN_SIZE
+
+        if end > num_samples:
+            continue
+
+        window = signals[start:end]
+        window_label = 1 if labels[start:end].sum() > 0 else 0
+
+        X.append(window)
+        y.append(window_label)
+
+    return np.array(X), np.array(y)
+
+
+# ================= PARTICIPANT PROCESSING =================
+def preprocess_from_list(participant_dir, agitation_list):
+
+    all_X, all_y = [], []
+    participant_dir = Path(participant_dir)
+    participant_name = participant_dir.name
+
+    with open(agitation_list, "r") as f:
+        agitation_days = [
+            line.strip().replace(".mat", ".csv")
+            for line in f
+        ]
+
+    for csv_name in agitation_days:
+
+        if not csv_name.startswith(participant_name + "-"):
+            continue
+
+        csv_file = participant_dir / csv_name
+
+        if not csv_file.exists():
+            print(f"  Skipping missing file: {csv_file.name}")
+            continue
+
+        print(f"  Processing {csv_file.name}")
+
+        try:
+            X, y = load_and_segment(csv_file)
+
+            if len(X) > 0:
+                all_X.append(X)
+                all_y.append(y)
+
+        except Exception as e:
+            print(f"  Error processing {csv_file.name}: {e}")
+
+    if not all_X:
+        print("  No valid data found for this participant.")
+        return None, None
+
+    X_all = np.concatenate(all_X, axis=0)
+    y_all = np.concatenate(all_y, axis=0)
+
+    print(f"  ✓ {X_all.shape[0]} windows extracted")
+
+    return X_all, y_all
+
+
+# ================= MAIN =================
+if __name__ == "__main__":
+
+    participants = [f"Participant{i}" for i in range(1, 18)]
+    agitation_txt = DATASET_ROOT / "Scripts/Agitation_Days.txt"
+
+    all_X, all_y, participant_ids = [], [], []
+
+    for idx, participant in enumerate(participants, start=1):
+
+        participant_path = DATASET_ROOT / participant
+        print(f"\n=== Processing {participant} ===")
+
+        X, y = preprocess_from_list(
+            participant_path,
+            agitation_txt
+        )
+
+        if X is not None:
+            all_X.append(X)
+            all_y.append(y)
+            participant_ids.append(
+                np.full(len(y), idx)
+            )
+
+    if not all_X:
+        print("\n❌ No data processed at all.")
+        exit(1)
+
+    X_all = np.concatenate(all_X, axis=0)
+    y_all = np.concatenate(all_y, axis=0)
+    ids_all = np.concatenate(participant_ids, axis=0)
+
+    out_dir = Path("processed_17p")
+    out_dir.mkdir(exist_ok=True)
+
+    np.save(out_dir / "X_train.npy", X_all)
+    np.save(out_dir / "y_train.npy", y_all)
+    np.save(out_dir / "participant_ids.npy", ids_all)
+
+    print("\n✅ Combined preprocessing complete")
+    print("X shape:", X_all.shape)
+    print("y shape:", y_all.shape)
+    print("participant IDs:", ids_all.shape)
+    print("Saved to:", out_dir.resolve())
