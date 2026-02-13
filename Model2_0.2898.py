@@ -1,0 +1,294 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import OneCycleLR
+from torch.utils.data import TensorDataset, DataLoader, WeightedRandomSampler
+import numpy as np
+import matplotlib.pyplot as plt
+import random
+import os
+
+# =========================================================
+# ECM MODULE
+# =========================================================
+class ECM(nn.Module):
+    def __init__(self, channels, kernel_size=3):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.conv = nn.Conv1d(
+            1, 1, kernel_size=kernel_size,
+            padding=(kernel_size - 1) // 2,
+            bias=False
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        y = x.transpose(1, 2)
+        y = self.avg_pool(y)
+        y = y.transpose(1, 2)
+        y = self.conv(y)
+        y = self.sigmoid(y)
+        return x * y
+
+
+# =========================================================
+# CROSS ATTENTION
+# =========================================================
+class CrossAttentionFusion(nn.Module):
+    def __init__(self, dim, num_heads=4):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            batch_first=True
+        )
+        self.norm = nn.LayerNorm(dim)
+        self.dropout = nn.Dropout(0.1)
+
+    def forward(self, query, key_value):
+        query = query.unsqueeze(1)
+        key_value = key_value.unsqueeze(1)
+        attn_out, _ = self.attn(query, key_value, key_value)
+        return self.norm(query.squeeze(1) + self.dropout(attn_out.squeeze(1)))
+
+
+# =========================================================
+# SIGNAL-SPECIFIC AUGMENTATION (WITH VISUAL DEBUG)
+# =========================================================
+def augment_signal_specific(x):
+    B, T, C = x.shape
+    x_aug = x.clone()
+
+    for c in range(C):
+        if c == 0:  # EDA
+            x_aug[:, :, c] += 0.05 * torch.randn_like(x_aug[:, :, c])
+            x_aug[:, :, c] *= (1 + 0.02 * torch.randn(B, T, device=x.device))
+
+        elif c == 1:  # ENMO
+            x_aug[:, :, c] += 0.05 * torch.randn_like(x_aug[:, :, c])
+            mask_len = int(T * 0.05)
+            if mask_len > 0:
+                for b in range(B):
+                    start = random.randint(0, T - mask_len)
+                    x_aug[b, start:start+mask_len, c] = 0
+            x_aug[:, :, c] *= (1 + 0.03 * torch.randn(B, T, device=x.device))
+
+        elif c == 2:  # BVP
+            x_aug[:, :, c] += 0.03 * torch.randn_like(x_aug[:, :, c])
+            x_aug[:, :, c] *= (1 + 0.02 * torch.randn(B, T, device=x.device))
+
+        elif c == 3:  # TEMP
+            x_aug[:, :, c] += 0.01 * torch.randn_like(x_aug[:, :, c])
+            x_aug[:, :, c] *= (1 + 0.01 * torch.randn(B, T, device=x.device))
+
+        elif c == 4:  # EDA density
+            x_aug[:, :, c] += 0.01 * torch.randn_like(x_aug[:, :, c])
+            x_aug[:, :, c] *= (1 + 0.01 * torch.randn(B, T, device=x.device))
+
+    return x_aug
+
+
+# =========================================================
+# AGITATION FOCAL LOSS (UPDATED)
+# =========================================================
+class AgitationFocalLoss(nn.Module):
+    def __init__(self, alpha=0.9, gamma=1.5, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        # 1. Calculate Standard BCE (no reduction yet)
+        BCE_loss = nn.functional.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+        
+        # 2. Calculate Probability (pt)
+        pt = torch.exp(-BCE_loss) 
+        
+        # 3. Apply Focal Term: (1-pt)^gamma silences easy examples
+        focal_loss = self.alpha * (1-pt)**self.gamma * BCE_loss
+
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        else:
+            return focal_loss
+
+
+# =========================================================
+# PATCH EMBEDDING
+# =========================================================
+class TemporalPatchEmbed(nn.Module):
+    def __init__(self, in_ch=5, embed_dim=64,
+                 kernel_size=5, stride=2, padding=2):
+        super().__init__()
+        self.proj = nn.Conv1d(
+            in_ch,
+            embed_dim,
+            kernel_size,
+            stride,
+            padding
+        )
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x):
+        # Expects (Batch, Time, Channel) -> Transpose for Conv1d
+        x = x.transpose(1, 2)
+        x = self.proj(x)
+        x = x.transpose(1, 2)
+        return self.norm(x)
+
+
+# =========================================================
+# POSITIONAL ENCODING
+# =========================================================
+class LearnablePositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000): # UPDATED TO 5000
+        super().__init__()
+        self.pe = nn.Parameter(torch.zeros(1, max_len, d_model))
+        self.cls = nn.Parameter(torch.zeros(1, 1, d_model))
+        nn.init.trunc_normal_(self.pe, std=0.02)
+        nn.init.trunc_normal_(self.cls, std=0.02)
+
+    def forward(self, x):
+        B, T, _ = x.shape
+        x = x + self.pe[:, :T]
+        cls = self.cls.expand(B, -1, -1)
+        return torch.cat([cls, x], dim=1)
+
+
+# =========================================================
+# MAIN MODEL
+# =========================================================
+class AgitationHybridPro(nn.Module):
+    def __init__(self,
+                 input_dim=5,
+                 embed_dim=128,
+                 lstm_hidden=64,
+                 num_heads=8,
+                 num_layers=4,
+                 conv_stride=2,
+                 max_len=5000, # UPDATED: Prevents crash with downsample=8
+                 transformer_dropout=0.05,
+                 head_dropout=0.1):
+
+        super().__init__()
+        self.patch = TemporalPatchEmbed(
+            in_ch=input_dim,
+            embed_dim=embed_dim,
+            stride=conv_stride
+        )
+        self.ecm = ECM(embed_dim)
+        self.pos = LearnablePositionalEncoding(embed_dim, max_len)
+
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=embed_dim * 4,
+            dropout=transformer_dropout,
+            activation="gelu",
+            batch_first=True
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers)
+
+        self.lstm = nn.LSTM(
+            input_size=input_dim,
+            hidden_size=lstm_hidden,
+            num_layers=2,
+            batch_first=True,
+            bidirectional=True,
+            dropout=0.05
+        )
+        self.fusion = CrossAttentionFusion(embed_dim)
+
+        self.head = nn.Sequential(
+            nn.Linear(embed_dim, 128),
+            nn.GELU(),
+            nn.Dropout(head_dropout),
+            nn.Linear(128, 1)
+        )
+
+    def forward(self, x):
+        # Transformer Branch
+        x_t = self.patch(x)
+        x_t = self.ecm(x_t)
+        x_t = self.pos(x_t)
+        x_t = self.encoder(x_t)
+        feat_t = x_t[:, 0]
+
+        # LSTM Branch
+        self.lstm.flatten_parameters()
+        _, (h, _) = self.lstm(x)
+        feat_l = torch.cat([h[-2], h[-1]], dim=1)
+
+        # Fusion
+        fused = self.fusion(feat_t, feat_l)
+        return self.head(fused).squeeze(-1)
+
+
+# =========================================================
+# MAIN EXECUTION
+# =========================================================
+if __name__ == "__main__":
+    torch.manual_seed(42)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print("Device:", device)
+
+    # Dummy Data Setup
+    N = 1000
+    x_data = torch.randn(N, 120, 5)
+    y_data = torch.cat([torch.zeros(900), torch.ones(100)]).long()
+
+    idx = torch.randperm(N)
+    x_data = x_data[idx]
+    y_data = y_data[idx]
+
+    weights = 1.0 / torch.tensor([900, 100], dtype=torch.float)
+    sample_weights = weights[y_data]
+    sampler = WeightedRandomSampler(sample_weights, N)
+
+    loader = DataLoader(
+        TensorDataset(x_data, y_data),
+        batch_size=32,
+        sampler=sampler
+    )
+
+    model = AgitationHybridPro(input_dim=5).to(device)
+    optimizer = AdamW(model.parameters(), lr=3e-4, weight_decay=1e-5)
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=3e-4,
+        total_steps=10 * len(loader)
+    )
+    
+    # --- [UPDATED] Use Aggressive Focal Loss ---
+    # Alpha=0.9: Agitation is 9x more important (Fixes low Recall)
+    # Gamma=1.5: Helps gradients flow better than 2.0
+    criterion = AgitationFocalLoss(alpha=0.9, gamma=1.5, reduction='mean')
+
+    print("Training...")
+
+    for epoch in range(10):
+        model.train()
+        total_loss = 0
+
+        for step, (xb, yb) in enumerate(loader):
+            xb = xb.to(device)
+            yb = yb.to(device)
+
+            # Augmentation (Visual debug handled inside function)
+            if epoch == 0 and step == 0:
+                 # Force run once to ensure debug print happens
+                 xb = augment_signal_specific(xb)
+            elif random.random() < 0.5:
+                 xb = augment_signal_specific(xb)
+
+            optimizer.zero_grad()
+            logits = model(xb)
+            loss = criterion(logits, yb.float()) # Ensure yb is float for BCE
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+            total_loss += loss.item()
+
+        print(f"Epoch {epoch+1} | Loss: {total_loss/len(loader):.4f}")
